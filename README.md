@@ -11,12 +11,13 @@ Mục tiêu của dự án là tạo trải nghiệm "nghe tiếng Nhật -> nh�
 - Backend Tauri (Rust) cho kiểm tra/cài model.
 - Streaming capture audio từ hệ thống (loopback theo nền tảng).
 - Nhận event realtime từ backend lên frontend.
-- Tích hợp transcribe bằng faster-whisper (Python script) trong luồng streaming.
+- Tích hợp transcribe realtime bằng persistent Python worker (không spawn Python theo từng cửa sổ nhỏ).
+- Tích hợp Silero VAD thật trong luồng streaming thông qua `faster_whisper.vad` để cắt segment trước khi decode Whisper.
 
 Chưa hoàn thiện:
 - Dịch Nhật -> Việt realtime trong UI hiện mới là placeholder.
 - Text-to-Speech hiện mới là placeholder ở frontend.
-- Cài đặt model Qwen/Silero/MeloTTS hiện chủ yếu tạo thư mục marker, chưa tải model thực tế.
+- Cài đặt model Qwen/MeloTTS hiện chủ yếu tạo thư mục marker, chưa tải model thực tế.
 
 ## 2) Công nghệ sử dụng
 
@@ -46,7 +47,7 @@ Gợi ý nhanh:
 
 Lưu ý:
 - Trên macOS, backend hiện ưu tiên backend capture kiểu ScreenCaptureKit.
-- Để cài faster-whisper model thành công, môi trường Python phải có package faster-whisper.
+- Để chạy transcription streaming ổn định, môi trường Python cần `faster-whisper` và `onnxruntime`.
 
 ## 4) Cài đặt và chạy dự án
 
@@ -56,11 +57,11 @@ Lưu ý:
 npm install
 ```
 
-### 4.2 Cài dependency Python cho Whisper
+### 4.2 Cài dependency Python cho Whisper + Silero VAD
 
 ```bash
 python3 -m pip install -U pip
-python3 -m pip install faster-whisper
+python3 -m pip install faster-whisper onnxruntime
 ```
 
 ### 4.3 Chạy web dev (Vite)
@@ -96,8 +97,9 @@ npm run tauri build
 2. Người dùng cài model từ UI (qua Tauri commands).
 3. Khi vào màn hình chính, bấm Start Recording để bắt đầu streaming capture.
 4. Frontend polling event từ backend (`get_streaming_events`) để cập nhật trạng thái/chunk/transcript.
-5. Nếu faster-whisper sẵn sàng, backend sẽ chạy worker transcription theo cửa sổ thời gian ngắn và trả event `TranscriptionReady`.
-6. Khi bấm Stop Recording, backend flush dữ liệu và trả metadata file ghi âm.
+5. Nếu faster-whisper sẵn sàng, backend chạy persistent transcription worker (`scripts/transcribe_worker.py`) và đẩy chunk ngắn từ Rust sang worker.
+6. Python worker dùng Silero VAD (`faster_whisper.vad`) để tách speech segment rồi mới decode Whisper và trả event `TranscriptionReady`.
+7. Khi bấm Stop Recording, backend flush segment còn pending rồi trả metadata file ghi âm.
 
 ## 7) Cấu trúc thư mục
 
@@ -115,7 +117,7 @@ npm run tauri build
 │       ├── models/             # Check/install model
 │       ├── transcription/      # Worker và wrapper transcribe
 │       └── utils/              # Đường dẫn, tiện ích
-└── scripts/                    # Python scripts (install/transcribe Whisper)
+└── scripts/                    # Python scripts (install/transcribe worker)
 ```
 
 ## 8) Các Tauri commands đang dùng
@@ -139,11 +141,11 @@ Nhóm audio/transcription:
 
 - Nếu cài Faster-Whisper bị lỗi, kiểm tra:
   - Python đang dùng có đúng không (`python3 --version`)
-  - Package `faster-whisper` đã được cài chưa
+  - Package `faster-whisper` và `onnxruntime` đã được cài chưa
   - Quyền ghi vào thư mục model của ứng dụng
 - Nếu không thấy transcript realtime:
   - Xác nhận model faster-whisper đã cài thành công ở màn hình Model Setup
-  - Kiểm tra log backend khi chạy `npm run tauri dev`
+  - Kiểm tra log backend khi chạy `npm run tauri dev` (đặc biệt các dòng `silero-segmented` trong transcription worker)
 - Trên một số thiết bị, chất lượng capture loopback ảnh hưởng trực tiếp chất lượng STT.
 
 ## 10) Roadmap đề xuất
