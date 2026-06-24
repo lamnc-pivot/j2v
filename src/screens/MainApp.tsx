@@ -19,6 +19,10 @@ const getDefaultBackend = (): CaptureBackendMode => {
   return "auto";
 };
 
+const EVENT_POLL_INTERVAL_MS = 100;
+const DURATION_TICK_INTERVAL_MS = 1000;
+const MAX_PENDING_TRANSLATIONS = 200;
+
 /** Streaming event types from backend */
 interface StreamingEvent {
   type:
@@ -27,7 +31,9 @@ interface StreamingEvent {
     | "Stopped"
     | "Error"
     | "TranscriptionReady"
-    | "TranscriptionError";
+    | "TranscriptionError"
+    | "TranslationReady"
+    | "TranslationError";
   sample_rate?: number;
   channels?: number;
   chunk?: {
@@ -39,10 +45,15 @@ interface StreamingEvent {
   sample_count?: number;
   file_path?: string | null;
   message?: string;
+  sequence_id?: number;
   /** TranscriptionReady fields */
   text?: string;
   language?: string;
   language_probability?: number;
+  /** TranslationReady fields */
+  source_text?: string;
+  translated_text?: string;
+  model?: string;
 }
 
 /**
@@ -55,9 +66,6 @@ interface StreamingEvent {
  * - Text-to-speech playback (placeholder)
  */
 const MainApp: React.FC = () => {
-  const EVENT_POLL_INTERVAL_MS = 100;
-  const DURATION_TICK_INTERVAL_MS = 1000;
-
   const [isRecording, setIsRecording] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -73,6 +81,9 @@ const MainApp: React.FC = () => {
   const startTimeRef = useRef<number | null>(null);
   const chunkCountRef = useRef(0);
   const lastTranscriptNormRef = useRef("");
+  const pendingTranslationsBySeqRef = useRef<Map<number, string>>(new Map());
+  const skippedTranslationSeqsRef = useRef<Set<number>>(new Set());
+  const nextExpectedTranslationSeqRef = useRef(1);
 
   const normalizeTranscript = useCallback((text: string) => {
     return text
@@ -89,6 +100,64 @@ const MainApp: React.FC = () => {
     if (durationIntervalRef.current) {
       clearInterval(durationIntervalRef.current);
       durationIntervalRef.current = null;
+    }
+  }, []);
+
+  const resetTranslationBuffers = useCallback(() => {
+    pendingTranslationsBySeqRef.current.clear();
+    skippedTranslationSeqsRef.current.clear();
+    nextExpectedTranslationSeqRef.current = 1;
+  }, []);
+
+  const flushTranslationBuffer = useCallback(() => {
+    const parts: string[] = [];
+    const pending = pendingTranslationsBySeqRef.current;
+    const skipped = skippedTranslationSeqsRef.current;
+
+    while (
+      pending.has(nextExpectedTranslationSeqRef.current) ||
+      skipped.has(nextExpectedTranslationSeqRef.current)
+    ) {
+      const seq = nextExpectedTranslationSeqRef.current;
+
+      if (skipped.has(seq)) {
+        skipped.delete(seq);
+        nextExpectedTranslationSeqRef.current += 1;
+        continue;
+      }
+
+      const text = pending.get(seq);
+      pending.delete(seq);
+      nextExpectedTranslationSeqRef.current += 1;
+
+      if (text && text.trim()) {
+        parts.push(text.trim());
+      }
+    }
+
+    if (parts.length > 0) {
+      const chunk = parts.join("\n");
+      setVietnameseText((prev) => (prev ? `${prev}\n${chunk}` : chunk));
+    }
+  }, []);
+
+  const enforcePendingTranslationLimit = useCallback(() => {
+    const pending = pendingTranslationsBySeqRef.current;
+    const skipped = skippedTranslationSeqsRef.current;
+
+    if (pending.size <= MAX_PENDING_TRANSLATIONS) {
+      return;
+    }
+
+    // Drop far-future entries first and mark them skipped to avoid blocking flush order.
+    const keysDesc = Array.from(pending.keys()).sort((a, b) => b - a);
+    while (pending.size > MAX_PENDING_TRANSLATIONS && keysDesc.length > 0) {
+      const dropSeq = keysDesc.shift();
+      if (typeof dropSeq !== "number") {
+        break;
+      }
+      pending.delete(dropSeq);
+      skipped.add(dropSeq);
     }
   }, []);
 
@@ -154,7 +223,9 @@ const MainApp: React.FC = () => {
               }
 
               lastTranscriptNormRef.current = normalized;
-              console.log(`📝 Transcription: ${event.text}`);
+              console.log(
+                `📝 Transcription #${event.sequence_id ?? "?"}: ${event.text}`
+              );
               // Append new text segment (each result is a ~3s window)
               setJapaneseText((prev) =>
                 prev ? `${prev}\n${event.text}` : event.text!
@@ -169,6 +240,39 @@ const MainApp: React.FC = () => {
             setIsTranscribing(false);
             setError(event.message || "Transcription error");
             break;
+
+          case "TranslationReady":
+            if (!event.translated_text?.trim()) {
+              break;
+            }
+
+            const translated = event.translated_text.trim();
+            const sequenceId = event.sequence_id;
+            if (typeof sequenceId === "number") {
+              console.log(
+                `🌐 Translation #${sequenceId} (${event.model || "qwen"}): ${translated}`
+              );
+              pendingTranslationsBySeqRef.current.set(sequenceId, translated);
+              enforcePendingTranslationLimit();
+              flushTranslationBuffer();
+            } else {
+              console.log(`🌐 Translation (${event.model || "qwen"}): ${translated}`);
+              setVietnameseText((prev) =>
+                prev ? `${prev}\n${translated}` : translated
+              );
+            }
+            break;
+
+          case "TranslationError":
+            console.warn(
+              `⚠️ Translation error #${event.sequence_id ?? "?"}: ${event.message}`
+            );
+            if (typeof event.sequence_id === "number") {
+              skippedTranslationSeqsRef.current.add(event.sequence_id);
+              flushTranslationBuffer();
+            }
+            setError(event.message || "Translation error");
+            break;
         }
       }
     } catch (err) {
@@ -176,7 +280,12 @@ const MainApp: React.FC = () => {
       const message = err instanceof Error ? err.message : String(err);
       setError(`Failed to poll streaming events: ${message}`);
     }
-  }, [normalizeTranscript, whisperAvailable]);
+  }, [
+    enforcePendingTranslationLimit,
+    flushTranslationBuffer,
+    normalizeTranscript,
+    whisperAvailable,
+  ]);
 
   /** Handle start/stop recording toggle */
   const handleStartRecording = useCallback(async () => {
@@ -197,6 +306,7 @@ const MainApp: React.FC = () => {
         setIsRecording(true);
         setJapaneseText("");
         setVietnameseText("");
+        resetTranslationBuffers();
         lastTranscriptNormRef.current = "";
         chunkCountRef.current = 0;
         startTimeRef.current = Date.now();
@@ -249,6 +359,7 @@ const MainApp: React.FC = () => {
     captureBackend,
     isRecording,
     pollStreamingEvents,
+    resetTranslationBuffers,
     whisperAvailable,
   ]);
 
@@ -266,13 +377,6 @@ const MainApp: React.FC = () => {
       // TODO: Integrate MeloTTS for audio playback
     }
   }, [vietnameseText]);
-
-  const japaneseLines = japaneseText
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
-  const latestJapaneseLine =
-    japaneseLines.length > 0 ? japaneseLines[japaneseLines.length - 1] : "";
 
   return (
     <div className="screen main-app-screen">
@@ -331,13 +435,6 @@ const MainApp: React.FC = () => {
                 Text-to-Speech
               </button>
             </div>
-          </div>
-
-          <div className="live-japanese-card">
-            <h3>Japanese Captured (Live)</h3>
-            <p>
-              {latestJapaneseLine || "Waiting for Japanese speech..."}
-            </p>
           </div>
 
           {isRecording && (

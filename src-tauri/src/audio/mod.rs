@@ -70,20 +70,42 @@ pub enum StreamingEvent {
         /// Error message
         message: String,
     },
-        /// Transcription result ready
-        TranscriptionReady {
-            /// Transcribed Japanese text
-            text: String,
-            /// Detected language code (e.g. "ja")
-            language: String,
-            /// Language detection confidence [0.0, 1.0]
-            language_probability: f32,
-        },
-        /// Error occurred during transcription
-        TranscriptionError {
-            /// Error message
-            message: String,
-        },
+    /// Transcription result ready
+    TranscriptionReady {
+        /// Monotonic sequence id for mapping transcript to translation
+        sequence_id: u64,
+        /// Transcribed Japanese text
+        text: String,
+        /// Detected language code (e.g. "ja")
+        language: String,
+        /// Language detection confidence [0.0, 1.0]
+        language_probability: f32,
+    },
+    /// Error occurred during transcription
+    TranscriptionError {
+        /// Error message
+        message: String,
+    },
+    /// Translation result ready
+    TranslationReady {
+        /// Monotonic sequence id matching TranscriptionReady
+        sequence_id: u64,
+        /// Source Japanese text used for translation
+        source_text: String,
+        /// Translated Vietnamese text
+        translated_text: String,
+        /// Translator model identifier
+        model: String,
+    },
+    /// Error occurred during translation
+    TranslationError {
+        /// Monotonic sequence id matching TranscriptionReady
+        sequence_id: u64,
+        /// Source Japanese text that failed translation
+        source_text: String,
+        /// Error message
+        message: String,
+    },
 }
 
 /// Real-time status of audio capture session

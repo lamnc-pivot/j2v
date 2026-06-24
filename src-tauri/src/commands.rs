@@ -1,11 +1,20 @@
-use crate::audio::{self, AudioCaptureConfig, AudioDevice, CaptureBackend, DeviceManager, StreamingEvent};
+use crate::audio::{
+    self, AudioCaptureConfig, AudioDevice, CaptureBackend, DeviceManager, StreamingEvent,
+};
 use crate::models::checker;
 use crate::models::installer;
 use crate::models::{ModelId, ModelStatus};
 use crate::transcription;
+use crate::translation;
 use crossbeam_channel;
+use crossbeam_channel::{Receiver, Sender};
 use parking_lot::Mutex;
 use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
+use std::time::Instant;
+
+const TRANSLATION_CONTEXT_SEGMENTS: usize = 4;
+const TRANSLATION_CONTEXT_MAX_CHARS: usize = 320;
 
 thread_local! {
     /// Thread-local storage for audio capture instance.
@@ -163,13 +172,13 @@ pub fn start_streaming_capture(
         config.input_device_name = input_device_name;
         config.capture_backend = parse_capture_backend(capture_backend);
         let mut audio_capture = audio::AudioCapture::new(config);
-        
+
         // Set up event channel
         audio_capture.set_event_channel(tx);
 
         // Start recording
         audio_capture.start()?;
-        
+
         *cap_ref = Some(audio_capture);
         *STREAM_EVENT_RX.lock() = Some(rx);
 
@@ -209,8 +218,10 @@ pub fn start_streaming_capture_with_transcription(
         let model_dir = crate::utils::paths::get_models_dir().join("faster-whisper");
         validate_whisper_model_dir(&model_dir)?;
 
-        // Transcription channel: worker → result_tx → result_rx (polled by frontend)
-        let (result_tx, result_rx) = crossbeam_channel::unbounded::<StreamingEvent>();
+        // Public channel polled by frontend.
+        let (frontend_tx, frontend_rx) = crossbeam_channel::unbounded::<StreamingEvent>();
+        // Internal channel for transcription-only events before translation stage.
+        let (transcription_tx, transcription_rx) = crossbeam_channel::unbounded::<StreamingEvent>();
 
         // We need the frontend to receive BOTH audio events AND transcription events.
         // Solve this by a fan-out relay thread: audio_tx is cloned so both the relay
@@ -221,16 +232,10 @@ pub fn start_streaming_capture_with_transcription(
         // forwards every event to BOTH the public result channel and the worker channel.
         let (relay_worker_tx, relay_worker_rx) = crossbeam_channel::unbounded::<StreamingEvent>();
         let (relay_in_tx, relay_in_rx) = crossbeam_channel::unbounded::<StreamingEvent>();
-        let relay_result_tx = result_tx.clone();
+        let relay_frontend_tx = frontend_tx.clone();
 
-        // Relay thread: reads from audio capture channel, fans out to frontend + worker
-        std::thread::spawn(move || {
-            while let Ok(event) = relay_in_rx.recv() {
-                let _ = relay_result_tx.send(event.clone());
-                let _ = relay_worker_tx.send(event);
-            }
-            log::debug!("Relay thread exiting");
-        });
+        spawn_relay_thread(relay_in_rx, relay_frontend_tx, relay_worker_tx);
+        spawn_translation_stage(transcription_rx, frontend_tx.clone());
 
         // Audio capture writes into relay_in_tx
         let mut config = AudioCaptureConfig::default();
@@ -249,10 +254,10 @@ pub fn start_streaming_capture_with_transcription(
             capture_channels
         );
 
-        // Spawn transcription worker – reads from relay_worker_rx, emits to result_tx
+        // Spawn transcription worker – reads from relay_worker_rx, emits transcription events.
         transcription::spawn_transcription_worker(
             relay_worker_rx,
-            result_tx,
+            transcription_tx,
             capture_sample_rate,
             capture_channels,
             model_dir,
@@ -260,7 +265,7 @@ pub fn start_streaming_capture_with_transcription(
         );
 
         *cap_ref = Some(audio_capture);
-        *STREAM_EVENT_RX.lock() = Some(result_rx);
+        *STREAM_EVENT_RX.lock() = Some(frontend_rx);
 
         log::info!("✅ Streaming capture + transcription started");
         Ok("Streaming capture with transcription started".to_string())
@@ -300,6 +305,157 @@ pub fn transcribe_audio_file(file_path: String) -> Result<String, String> {
         result.text
     );
     Ok(result.text)
+}
+
+/// Translates Japanese text to Vietnamese using local Ollama + Qwen model.
+///
+/// # Arguments
+/// * `text` - Source Japanese text
+///
+/// # Returns
+/// Translated Vietnamese text.
+#[tauri::command]
+pub fn translate_text(text: String) -> Result<String, String> {
+    log::info!(
+        "🌐 Translation request received ({} chars)",
+        text.chars().count()
+    );
+    let translated = translation::translate_ja_to_vi(&text)?;
+    log::info!(
+        "✅ Translation completed ({} chars)",
+        translated.chars().count()
+    );
+    Ok(translated)
+}
+
+fn spawn_relay_thread(
+    relay_in_rx: Receiver<StreamingEvent>,
+    relay_frontend_tx: Sender<StreamingEvent>,
+    relay_worker_tx: Sender<StreamingEvent>,
+) {
+    std::thread::spawn(move || {
+        while let Ok(event) = relay_in_rx.recv() {
+            let _ = relay_frontend_tx.send(event.clone());
+            let _ = relay_worker_tx.send(event);
+        }
+        log::debug!("Relay thread exiting");
+    });
+}
+
+fn spawn_translation_stage(
+    transcription_rx: Receiver<StreamingEvent>,
+    translation_frontend_tx: Sender<StreamingEvent>,
+) {
+    std::thread::spawn(move || {
+        let mut translation_started_at: HashMap<u64, Instant> = HashMap::new();
+        let mut recent_source_history: VecDeque<String> = VecDeque::new();
+
+        while let Ok(event) = transcription_rx.recv() {
+            let _ = translation_frontend_tx.send(event.clone());
+
+            let StreamingEvent::TranscriptionReady {
+                sequence_id, text, ..
+            } = &event
+            else {
+                continue;
+            };
+
+            let source_text = text.trim().to_string();
+            if source_text.is_empty() {
+                continue;
+            }
+
+            let context_segments: Vec<String> = recent_source_history.iter().cloned().collect();
+
+            let backlog_before = transcription_rx.len();
+            translation_started_at.insert(*sequence_id, Instant::now());
+            log::info!(
+                "metric.translation_start seq={} source_chars={} context_segments={} backlog_before={}",
+                sequence_id,
+                source_text.chars().count(),
+                context_segments.len(),
+                backlog_before
+            );
+
+            match translation::translate_ja_to_vi_with_context(&source_text, &context_segments) {
+                Ok(translated_text) => {
+                    let latency_ms =
+                        remove_translation_start(&mut translation_started_at, *sequence_id);
+                    let backlog_after = transcription_rx.len();
+                    log::info!(
+                        "metric.translation_ready seq={} latency_ms={} translated_chars={} backlog_after={}",
+                        sequence_id,
+                        latency_ms,
+                        translated_text.chars().count(),
+                        backlog_after
+                    );
+
+                    let _ = translation_frontend_tx.send(StreamingEvent::TranslationReady {
+                        sequence_id: *sequence_id,
+                        source_text: source_text.clone(),
+                        translated_text,
+                        model: translation::model_name().to_string(),
+                    });
+                }
+                Err(message) => {
+                    let latency_ms =
+                        remove_translation_start(&mut translation_started_at, *sequence_id);
+                    let backlog_after = transcription_rx.len();
+                    log::warn!(
+                        "metric.translation_error seq={} latency_ms={} backlog_after={} message={}",
+                        sequence_id,
+                        latency_ms,
+                        backlog_after,
+                        message
+                    );
+
+                    let _ = translation_frontend_tx.send(StreamingEvent::TranslationError {
+                        sequence_id: *sequence_id,
+                        source_text: source_text.clone(),
+                        message,
+                    });
+                }
+            }
+
+            push_translation_context_segment(
+                &mut recent_source_history,
+                source_text,
+                TRANSLATION_CONTEXT_SEGMENTS,
+                TRANSLATION_CONTEXT_MAX_CHARS,
+            );
+        }
+
+        log::debug!("Translation stage exiting");
+    });
+}
+
+fn push_translation_context_segment(
+    history: &mut VecDeque<String>,
+    current_source: String,
+    max_segments: usize,
+    max_chars_per_segment: usize,
+) {
+    let normalized = current_source.trim();
+    if normalized.is_empty() {
+        return;
+    }
+
+    let bounded = normalized
+        .chars()
+        .take(max_chars_per_segment)
+        .collect::<String>();
+    history.push_back(bounded);
+
+    while history.len() > max_segments {
+        let _ = history.pop_front();
+    }
+}
+
+fn remove_translation_start(starts: &mut HashMap<u64, Instant>, sequence_id: u64) -> u128 {
+    starts
+        .remove(&sequence_id)
+        .map(|started| started.elapsed().as_millis())
+        .unwrap_or(0)
 }
 
 fn validate_whisper_model_dir(model_dir: &std::path::Path) -> Result<(), String> {
