@@ -1,169 +1,190 @@
 # J2V App
 
-Ứng dụng desktop dịch tiếng Nhật sang tiếng Việt theo luồng thời gian thực, xây dựng bằng Tauri + React + TypeScript.
+Ứng dụng desktop dịch tiếng Nhật sang tiếng Việt theo thời gian thực, xây dựng với Tauri + React + TypeScript.
 
-Mục tiêu của dự án là tạo trải nghiệm "nghe tiếng Nhật -> nhận transcript nhanh -> dịch sang tiếng Việt -> phát lại TTS" trong một app desktop gọn nhẹ.
+Mục tiêu của dự án là cung cấp luồng: nghe tiếng Nhật từ audio hệ thống -> nhận transcript -> dịch sang tiếng Việt -> chuẩn bị cho TTS.
 
-## 1) Trạng thái hiện tại
+## Tính năng hiện có
 
-Đã làm:
-- Luồng 2 màn hình: kiểm tra model -> màn hình chính.
-- Backend Tauri (Rust) cho kiểm tra/cài model.
-- Streaming capture audio từ hệ thống (loopback theo nền tảng).
-- Nhận event realtime từ backend lên frontend.
-- Tích hợp transcribe realtime bằng persistent Python worker (không spawn Python theo từng cửa sổ nhỏ).
-- Tích hợp Silero VAD thật trong luồng streaming thông qua `faster_whisper.vad` để cắt segment trước khi decode Whisper.
+- Luồng 2 màn hình:
+  - Model Setup: kiểm tra và cài model/phụ thuộc cần thiết.
+  - Main App: start/stop streaming và hiển thị kết quả realtime.
+- Capture audio hệ thống theo backend nền tảng (macOS/Windows) và phát event theo lô.
+- Transcription realtime bằng persistent Python worker (faster-whisper), không spawn process cho từng chunk.
+- Silero VAD trong worker để tách đoạn speech trước khi decode.
+- Dịch Nhật -> Việt ở backend qua Ollama (model qwen2.5:7b), có retry + circuit breaker.
+- Frontend xử lý buffering translation theo sequence để giữ đúng thứ tự hiển thị.
 
-Chưa hoàn thiện:
-- Dịch Nhật -> Việt realtime trong UI hiện mới là placeholder.
-- Text-to-Speech hiện mới là placeholder ở frontend.
-- Cài đặt model Qwen/MeloTTS hiện chủ yếu tạo thư mục marker, chưa tải model thực tế.
+## Tính năng đang ở mức placeholder
 
-## 2) Công nghệ sử dụng
+- Nút Text-to-Speech trong UI mới là placeholder, chưa playback thật bằng MeloTTS.
+- Cài MeloTTS trong màn hình model hiện vẫn chủ yếu tạo marker thư mục (chưa tải runtime đầy đủ).
 
-- Frontend: React 18 + TypeScript + Vite
-- Desktop shell: Tauri 2
-- Backend: Rust
-- STT: faster-whisper (Python)
+## Tech stack
 
-Phiên bản chính (tham chiếu từ mã nguồn hiện tại):
-- Node: khuyến nghị 20+
-- React: 18.3.1
-- TypeScript: 5.6.x
-- Vite: 6.0.x
-- Tauri: 2.0.x
+- Frontend: React 18, TypeScript 5, Vite 6
+- Desktop: Tauri 2
+- Backend app: Rust
+- STT: Python faster-whisper
+- Translation: Ollama HTTP API (mặc định qwen2.5:7b)
 
-## 3) Yêu cầu môi trường
+## Yêu cầu môi trường
 
 Bạn cần cài đặt:
+
 - Node.js + npm
 - Rust toolchain (cargo, rustc)
 - Python 3 (khuyến nghị 3.10+)
+- Ollama (để chạy translation backend)
+- Các prerequisite của Tauri theo OS
 
-Gợi ý nhanh:
-- Node: https://nodejs.org
-- Rust: https://rustup.rs
-- Tauri prerequisites: https://tauri.app/start/prerequisites/
+Tham khảo:
 
-Lưu ý:
-- Trên macOS, backend hiện ưu tiên backend capture kiểu ScreenCaptureKit.
-- Để chạy transcription streaming ổn định, môi trường Python cần `faster-whisper` và `onnxruntime`.
+- https://tauri.app/start/prerequisites/
+- https://rustup.rs/
+- https://nodejs.org/
+- https://ollama.com/
 
-## 4) Cài đặt và chạy dự án
+## Cài đặt và chạy nhanh
 
-### 4.1 Cài dependency JavaScript
+### 1) Cài dependency frontend
 
 ```bash
 npm install
 ```
 
-### 4.2 Cài dependency Python cho Whisper + Silero VAD
+### 2) Cài dependency Python cho transcription
 
 ```bash
 python3 -m pip install -U pip
-python3 -m pip install faster-whisper onnxruntime
+python3 -m pip install faster-whisper onnxruntime numpy
 ```
 
-### 4.3 Chạy web dev (Vite)
-
-```bash
-npm run dev
-```
-
-### 4.4 Chạy app desktop (Tauri dev)
+### 3) Chạy app desktop ở chế độ dev
 
 ```bash
 npm run tauri dev
 ```
 
-### 4.5 Build production
+Ghi chú:
+
+- Có thể chạy web-only bằng lệnh `npm run dev`.
+- Translation qua Ollama yêu cầu Ollama daemon đang chạy và model qwen2.5:7b đã pull xong.
+
+### 4) Build production
 
 ```bash
 npm run build
 npm run tauri build
 ```
 
-## 5) Scripts chính
+## Scripts npm
 
 - `npm run dev`: chạy Vite dev server
-- `npm run build`: type-check + build frontend
-- `npm run preview`: preview frontend build
-- `npm run tauri dev`: chạy desktop app chế độ dev
-- `npm run tauri build`: build desktop bundle
+- `npm run build`: chạy TypeScript build + Vite build
+- `npm run preview`: preview frontend dist
+- `npm run tauri`: gọi Tauri CLI (ví dụ `npm run tauri dev`, `npm run tauri build`)
 
-## 6) Luồng hoạt động
+## Luồng hoạt động chính
 
-1. Màn hình Model Setup gọi command backend để kiểm tra trạng thái model.
-2. Người dùng cài model từ UI (qua Tauri commands).
-3. Khi vào màn hình chính, bấm Start Recording để bắt đầu streaming capture.
-4. Frontend polling event từ backend (`get_streaming_events`) để cập nhật trạng thái/chunk/transcript.
-5. Nếu faster-whisper sẵn sàng, backend chạy persistent transcription worker (`scripts/transcribe_worker.py`) và đẩy chunk ngắn từ Rust sang worker.
-6. Python worker dùng Silero VAD (`faster_whisper.vad`) để tách speech segment rồi mới decode Whisper và trả event `TranscriptionReady`.
-7. Khi bấm Stop Recording, backend flush segment còn pending rồi trả metadata file ghi âm.
+1. Frontend gọi `check_model_status` để lấy trạng thái 5 model.
+2. Người dùng cài model qua `install_model`.
+3. Khi bấm Start Recording:
+   - Nếu Faster-Whisper sẵn sàng: gọi `start_streaming_capture_with_transcription`.
+   - Nếu chưa sẵn sàng: gọi `start_streaming_capture` (chỉ capture audio event).
+4. Frontend polling `get_streaming_events` mỗi 100ms để nhận:
+   - `ChunkReceived`
+   - `TranscriptionReady` / `TranscriptionError`
+   - `TranslationReady` / `TranslationError`
+5. Khi Stop Recording: gọi `stop_streaming_capture` và flush nốt event tồn.
 
-## 7) Cấu trúc thư mục
+## Mô hình model hiện tại
+
+- Ollama:
+  - Check: kiểm tra thư mục cài đặt Ollama theo OS.
+  - Install: dùng cài tự động theo OS (macOS qua Homebrew).
+- Qwen2.5-7B:
+  - Check: parse kết quả `ollama list` để tìm tag `qwen2.5:7b`.
+  - Install: chạy `ollama pull qwen2.5:7b`.
+- Faster-Whisper:
+  - Install: chạy script `scripts/install_whisper_model.py` (mặc định profile `small`).
+  - Check: xác thực có `model.bin` + `config.json` (trực tiếp hoặc nested dir).
+- Silero VAD:
+  - Install: tải runtime `silero_vad_v6.onnx` vào `faster_whisper/assets` trong Python environment hiện tại.
+  - Check: xác thực file runtime `silero_vad_v6.onnx` tồn tại đúng asset path mà `faster_whisper` sử dụng.
+- MeloTTS:
+  - Check/install tạm thời theo marker folder trong thư mục models của app.
+
+## Capture backend và nền tảng
+
+- macOS:
+  - Mặc định frontend chọn `screen-capture-kit`.
+  - Tauri bundle yêu cầu macOS tối thiểu 13.0.
+- Windows:
+  - Frontend có option `wasapi-loopback`.
+- Chế độ `auto` vẫn có sẵn.
+
+## Các Tauri commands đã expose
+
+- Model:
+  - `check_model_status`
+  - `install_model`
+- Audio:
+  - `start_audio_capture`
+  - `stop_audio_capture`
+  - `list_audio_devices`
+  - `get_audio_capture_status`
+  - `start_streaming_capture`
+  - `start_streaming_capture_with_transcription`
+  - `stop_streaming_capture`
+  - `get_streaming_events`
+- STT/Translate:
+  - `transcribe_audio_file`
+  - `translate_text`
+
+## Cấu trúc thư mục
 
 ```text
 .
 ├── src/                        # Frontend React
-│   ├── screens/                # Màn hình ModelCheck và MainApp
-│   ├── components/             # Component tái sử dụng
-│   ├── types/                  # Kiểu dữ liệu frontend
-│   └── styles.css              # CSS global
-├── src-tauri/                  # Backend Rust + cấu hình Tauri
+│   ├── screens/                # ModelCheck, MainApp
+│   ├── components/             # UI components
+│   ├── types/                  # TypeScript types
+│   └── styles.css              # Global styles
+├── src-tauri/                  # Backend Rust + Tauri config
 │   └── src/
-│       ├── commands.rs         # Tauri commands bridge frontend <-> backend
-│       ├── audio/              # Capture audio theo nền tảng
-│       ├── models/             # Check/install model
-│       ├── transcription/      # Worker và wrapper transcribe
-│       └── utils/              # Đường dẫn, tiện ích
-└── scripts/                    # Python scripts (install/transcribe worker)
+│       ├── commands.rs         # Tauri commands
+│       ├── audio/              # Capture/audio events
+│       ├── models/             # Model check/install
+│       ├── transcription/      # Persistent worker integration
+│       ├── translation.rs      # Ollama translation worker
+│       └── utils/              # Path/util helpers
+└── scripts/                    # Python scripts cho Whisper
 ```
 
-## 8) Các Tauri commands đang dùng
+## Troubleshooting nhanh
 
-Nhóm model:
-- `check_model_status`
-- `install_model`
+### Không có transcript realtime
 
-Nhóm audio/transcription:
-- `start_audio_capture`
-- `stop_audio_capture`
-- `list_audio_devices`
-- `get_audio_capture_status`
-- `start_streaming_capture`
-- `start_streaming_capture_with_transcription`
-- `stop_streaming_capture`
-- `get_streaming_events`
-- `transcribe_audio_file`
+- Kiểm tra Faster-Whisper đã install thành công ở màn hình Model Setup.
+- Đảm bảo Python có `faster-whisper`, `onnxruntime`, `numpy`.
+- Xem log khi chạy `npm run tauri dev` để tìm lỗi worker/script.
 
-## 9) Lưu ý vận hành
+### Không có bản dịch tiếng Việt
 
-- Nếu cài Faster-Whisper bị lỗi, kiểm tra:
-  - Python đang dùng có đúng không (`python3 --version`)
-  - Package `faster-whisper` và `onnxruntime` đã được cài chưa
-  - Quyền ghi vào thư mục model của ứng dụng
-- Nếu không thấy transcript realtime:
-  - Xác nhận model faster-whisper đã cài thành công ở màn hình Model Setup
-  - Kiểm tra log backend khi chạy `npm run tauri dev` (đặc biệt các dòng `silero-segmented` trong transcription worker)
-- Trên một số thiết bị, chất lượng capture loopback ảnh hưởng trực tiếp chất lượng STT.
+- Đảm bảo Ollama đang chạy local tại `http://127.0.0.1:11434`.
+- Đảm bảo đã pull model `qwen2.5:7b`.
+- Nếu backend báo circuit breaker mở, chờ vài giây để worker thử lại.
 
-## 10) Roadmap đề xuất
+### Cài Ollama thất bại trên macOS
 
-- Tích hợp translator backend thật (ví dụ Ollama + Qwen) cho luồng Nhật -> Việt.
-- Tích hợp TTS thực (MeloTTS) và playback theo chunk.
-- Chuẩn hóa cơ chế quản lý model (versioning, verify checksum, retry).
-- Bổ sung test tự động cho commands Rust và luồng frontend.
-- Thêm telemetry/logging có cấu trúc để debug realtime pipeline.
+- Cần Homebrew sẵn sàng nếu dùng cài tự động từ app.
+- Có thể cài thủ công từ trang Ollama rồi kiểm tra lại trong app.
 
-## 11) Đóng góp
+## Đóng góp
 
-Nếu bạn muốn đóng góp:
-- Fork repository
-- Tạo branch tính năng
-- Commit rõ ràng theo từng thay đổi
-- Mở Pull Request với mô tả ngắn gọn và cách kiểm thử
+Xem hướng dẫn chi tiết tại file CONTRIBUTING.md.
 
-## 12) License
+## License
 
-Dự án hiện chưa khai báo file LICENSE trong repository. Bạn nên thêm LICENSE (ví dụ MIT) để rõ ràng quyền sử dụng.
+Dự án có khai báo license trong file LICENSE.
