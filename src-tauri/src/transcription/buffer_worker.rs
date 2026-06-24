@@ -50,6 +50,7 @@ fn run_worker(
     let mut worker = PersistentWhisperWorker::new(&model_dir, &script_path)?;
     let mut pending_chunk: Vec<i16> = Vec::with_capacity(push_chunk_samples * 2);
     let mut last_emitted_norm: Option<String> = None;
+    let mut next_sequence_id: u64 = 1;
 
     log::info!(
         "🧵 Transcription worker started ({}Hz, {}ch, silero-segmented)",
@@ -75,6 +76,7 @@ fn run_worker(
                         &mut worker,
                         &event_tx,
                         &mut last_emitted_norm,
+                        &mut next_sequence_id,
                     );
                     if has_text {
                         log::debug!("Transcription worker emitted finalized speech segment(s)");
@@ -89,6 +91,7 @@ fn run_worker(
                         &mut worker,
                         &event_tx,
                         &mut last_emitted_norm,
+                        &mut next_sequence_id,
                     );
                 }
 
@@ -96,6 +99,7 @@ fn run_worker(
                     &mut worker,
                     &event_tx,
                     &mut last_emitted_norm,
+                    &mut next_sequence_id,
                 )?;
                 if !flushed_any {
                     log::debug!("No pending speech segments to flush on stop");
@@ -114,10 +118,16 @@ fn run_worker(
                         &mut worker,
                         &event_tx,
                         &mut last_emitted_norm,
+                        &mut next_sequence_id,
                     );
                 }
 
-                let _ = flush_worker_results(&mut worker, &event_tx, &mut last_emitted_norm);
+                let _ = flush_worker_results(
+                    &mut worker,
+                    &event_tx,
+                    &mut last_emitted_norm,
+                    &mut next_sequence_id,
+                );
                 worker.shutdown();
                 log::info!("🧵 Transcription worker exiting (channel closed)");
                 return Ok(());
@@ -131,6 +141,7 @@ fn transcribe_buffer(
     worker: &mut PersistentWhisperWorker,
     event_tx: &Sender<StreamingEvent>,
     last_emitted_norm: &mut Option<String>,
+    next_sequence_id: &mut u64,
 ) -> bool {
     if pcm.is_empty() {
         return false;
@@ -150,7 +161,7 @@ fn transcribe_buffer(
     match worker.transcribe_file(&tmp_path) {
         Ok(results) => {
             let _ = std::fs::remove_file(&tmp_path);
-            emit_transcription_results(results, event_tx, last_emitted_norm)
+            emit_transcription_results(results, event_tx, last_emitted_norm, next_sequence_id)
         }
         Err(e) => {
             let _ = std::fs::remove_file(&tmp_path);
@@ -165,15 +176,22 @@ fn flush_worker_results(
     worker: &mut PersistentWhisperWorker,
     event_tx: &Sender<StreamingEvent>,
     last_emitted_norm: &mut Option<String>,
+    next_sequence_id: &mut u64,
 ) -> Result<bool, String> {
     let results = worker.flush_pending()?;
-    Ok(emit_transcription_results(results, event_tx, last_emitted_norm))
+    Ok(emit_transcription_results(
+        results,
+        event_tx,
+        last_emitted_norm,
+        next_sequence_id,
+    ))
 }
 
 fn emit_transcription_results(
     results: Vec<crate::transcription::persistent_whisper::PersistentTranscriptionResult>,
     event_tx: &Sender<StreamingEvent>,
     last_emitted_norm: &mut Option<String>,
+    next_sequence_id: &mut u64,
 ) -> bool {
     let mut emitted = false;
 
@@ -189,8 +207,18 @@ fn emit_transcription_results(
         }
 
         *last_emitted_norm = Some(norm);
+        let sequence_id = *next_sequence_id;
+        *next_sequence_id = next_sequence_id.saturating_add(1);
         log::info!("📝 Transcribed: {}", result.text);
+        log::info!(
+            "metric.transcription_emit seq={} text_chars={} lang={} lang_p={:.3}",
+            sequence_id,
+            result.text.chars().count(),
+            result.language,
+            result.language_probability
+        );
         let _ = event_tx.send(StreamingEvent::TranscriptionReady {
+            sequence_id,
             text: result.text,
             language: result.language,
             language_probability: result.language_probability,

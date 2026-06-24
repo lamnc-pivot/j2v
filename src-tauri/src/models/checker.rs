@@ -1,7 +1,10 @@
 use std::path::PathBuf;
+use std::process::Command;
 
 use super::{ModelId, ModelStatus};
 use crate::utils::paths::get_models_dir;
+
+const QWEN_MODEL_TAG: &str = "qwen2.5:7b";
 
 pub fn check_all_models() -> Vec<ModelStatus> {
     log::debug!("Checking all models...");
@@ -17,7 +20,7 @@ pub fn check_model(model_id: ModelId) -> ModelStatus {
 
     match model_id {
         ModelId::Ollama => check_ollama(),
-        ModelId::Qwen => check_generic_model(model_id, "Qwen2.5-7B"),
+        ModelId::Qwen => check_qwen(),
         ModelId::FasterWhisper => check_faster_whisper(),
         ModelId::SileroVad => check_generic_model(model_id, "silero-vad"),
         ModelId::MeloTts => check_generic_model(model_id, "melotts"),
@@ -62,6 +65,39 @@ fn check_generic_model(model_id: ModelId, directory_name: &str) -> ModelStatus {
     let path = model_dir.to_str().map(|s| s.to_string());
 
     ModelStatus::new(model_id, installed, path)
+}
+
+fn check_qwen() -> ModelStatus {
+    let installed = match run_ollama(&["list"]) {
+        Ok(output) if output.status.success() => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            parse_ollama_list_contains_model(&stdout, QWEN_MODEL_TAG)
+        }
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::debug!("Failed to query Ollama list for Qwen check: {}", stderr.trim());
+            false
+        }
+        Err(error) => {
+            log::debug!("Ollama unavailable during Qwen check: {}", error);
+            false
+        }
+    };
+
+    log::debug!(
+        "{} status: {} (model: {})",
+        ModelId::Qwen.display_name(),
+        if installed { "installed" } else { "not installed" },
+        QWEN_MODEL_TAG
+    );
+
+    let path = if installed {
+        Some(format!("ollama://{}", QWEN_MODEL_TAG))
+    } else {
+        None
+    };
+
+    ModelStatus::new(ModelId::Qwen, installed, path)
 }
 
 fn check_faster_whisper() -> ModelStatus {
@@ -122,5 +158,20 @@ fn get_ollama_path() -> Option<String> {
     } else {
         Some(format!("{}/.ollama", dirs::home_dir()?.display()))
     }
+}
+
+fn parse_ollama_list_contains_model(output: &str, model_tag: &str) -> bool {
+    output
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_whitespace().next())
+        .any(|name| name == model_tag)
+}
+
+fn run_ollama(args: &[&str]) -> Result<std::process::Output, String> {
+    Command::new("ollama")
+        .args(args)
+        .output()
+        .map_err(|e| format!("Failed to execute ollama {:?}: {}", args, e))
 }
 

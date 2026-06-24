@@ -5,6 +5,8 @@ use super::ModelId;
 use crate::error::{AppError, AppResult};
 use crate::utils::paths::get_models_dir;
 
+const QWEN_MODEL_TAG: &str = "qwen2.5:7b";
+
 pub fn install_model(model_id: ModelId) -> AppResult<String> {
     log::info!("📥 Starting installation for {}", model_id.display_name());
 
@@ -12,7 +14,7 @@ pub fn install_model(model_id: ModelId) -> AppResult<String> {
 
     match model_id {
         ModelId::Ollama => install_ollama(),
-        ModelId::Qwen => install_generic_model(model_id, "Qwen2.5-7B"),
+        ModelId::Qwen => install_qwen_model(),
         ModelId::FasterWhisper => install_faster_whisper(),
         ModelId::SileroVad => install_generic_model(model_id, "silero-vad"),
         ModelId::MeloTts => install_generic_model(model_id, "melotts"),
@@ -129,6 +131,86 @@ fn install_generic_model(model_id: ModelId, directory_name: &str) -> AppResult<S
     let message = format!("{} model prepared", model_id.display_name());
     log::info!("✅ {}", message);
     Ok(message)
+}
+
+fn install_qwen_model() -> AppResult<String> {
+    ensure_ollama_cli_available()?;
+
+    if is_ollama_model_installed(QWEN_MODEL_TAG)? {
+        let message = format!("Qwen model already installed ({})", QWEN_MODEL_TAG);
+        log::info!("✅ {}", message);
+        return Ok(message);
+    }
+
+    log::info!("Pulling Qwen model via Ollama: {}", QWEN_MODEL_TAG);
+    let output = run_ollama(&["pull", QWEN_MODEL_TAG])?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = if !stderr.trim().is_empty() {
+            stderr.trim().to_string()
+        } else {
+            stdout.trim().to_string()
+        };
+
+        return Err(AppError::InstallationError(format!(
+            "Failed to pull Qwen model ({}): {}",
+            QWEN_MODEL_TAG, detail
+        )));
+    }
+
+    if !is_ollama_model_installed(QWEN_MODEL_TAG)? {
+        return Err(AppError::InstallationError(format!(
+            "Qwen model pull finished but verification failed for {}",
+            QWEN_MODEL_TAG
+        )));
+    }
+
+    let message = format!("Qwen model installed successfully ({})", QWEN_MODEL_TAG);
+    log::info!("✅ {}", message);
+    Ok(message)
+}
+
+fn ensure_ollama_cli_available() -> AppResult<()> {
+    let output = run_ollama(&["--version"])?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(AppError::InstallationError(format!(
+        "Ollama is not available. Please install/start Ollama first: {}",
+        stderr.trim()
+    )))
+}
+
+fn is_ollama_model_installed(model_tag: &str) -> AppResult<bool> {
+    let output = run_ollama(&["list"])?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(AppError::InstallationError(format!(
+            "Failed to query Ollama model list: {}",
+            stderr.trim()
+        )));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_ollama_list_contains_model(&stdout, model_tag))
+}
+
+fn parse_ollama_list_contains_model(output: &str, model_tag: &str) -> bool {
+    output
+        .lines()
+        .skip(1)
+        .filter_map(|line| line.split_whitespace().next())
+        .any(|name| name == model_tag)
+}
+
+fn run_ollama(args: &[&str]) -> AppResult<std::process::Output> {
+    Command::new("ollama").args(args).output().map_err(|e| {
+        AppError::InstallationError(format!("Failed to execute ollama {:?}: {}", args, e))
+    })
 }
 
 fn mark_model_installed(model_dir: &PathBuf) -> AppResult<()> {

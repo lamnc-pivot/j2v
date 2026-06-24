@@ -3,6 +3,7 @@ mod commands;
 mod error;
 mod models;
 mod transcription;
+mod translation;
 mod utils;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -29,6 +30,7 @@ pub fn run() {
             commands::get_streaming_events,
             commands::start_streaming_capture_with_transcription,
             commands::transcribe_audio_file,
+            commands::translate_text,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
