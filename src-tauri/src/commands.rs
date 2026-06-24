@@ -1,4 +1,6 @@
-use crate::audio::{self, AudioCaptureConfig, AudioDevice, CaptureBackend, DeviceManager, StreamingEvent};
+use crate::audio::{
+    self, AudioCaptureConfig, AudioDevice, CaptureBackend, DeviceManager, StreamingEvent,
+};
 use crate::models::checker;
 use crate::models::installer;
 use crate::models::{ModelId, ModelStatus};
@@ -8,8 +10,11 @@ use crossbeam_channel;
 use crossbeam_channel::{Receiver, Sender};
 use parking_lot::Mutex;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
+
+const TRANSLATION_CONTEXT_SEGMENTS: usize = 4;
+const TRANSLATION_CONTEXT_MAX_CHARS: usize = 320;
 
 thread_local! {
     /// Thread-local storage for audio capture instance.
@@ -167,13 +172,13 @@ pub fn start_streaming_capture(
         config.input_device_name = input_device_name;
         config.capture_backend = parse_capture_backend(capture_backend);
         let mut audio_capture = audio::AudioCapture::new(config);
-        
+
         // Set up event channel
         audio_capture.set_event_channel(tx);
 
         // Start recording
         audio_capture.start()?;
-        
+
         *cap_ref = Some(audio_capture);
         *STREAM_EVENT_RX.lock() = Some(rx);
 
@@ -311,7 +316,10 @@ pub fn transcribe_audio_file(file_path: String) -> Result<String, String> {
 /// Translated Vietnamese text.
 #[tauri::command]
 pub fn translate_text(text: String) -> Result<String, String> {
-    log::info!("🌐 Translation request received ({} chars)", text.chars().count());
+    log::info!(
+        "🌐 Translation request received ({} chars)",
+        text.chars().count()
+    );
     let translated = translation::translate_ja_to_vi(&text)?;
     log::info!(
         "✅ Translation completed ({} chars)",
@@ -340,14 +348,13 @@ fn spawn_translation_stage(
 ) {
     std::thread::spawn(move || {
         let mut translation_started_at: HashMap<u64, Instant> = HashMap::new();
+        let mut recent_source_history: VecDeque<String> = VecDeque::new();
 
         while let Ok(event) = transcription_rx.recv() {
             let _ = translation_frontend_tx.send(event.clone());
 
             let StreamingEvent::TranscriptionReady {
-                sequence_id,
-                text,
-                ..
+                sequence_id, text, ..
             } = &event
             else {
                 continue;
@@ -358,18 +365,22 @@ fn spawn_translation_stage(
                 continue;
             }
 
+            let context_segments: Vec<String> = recent_source_history.iter().cloned().collect();
+
             let backlog_before = transcription_rx.len();
             translation_started_at.insert(*sequence_id, Instant::now());
             log::info!(
-                "metric.translation_start seq={} source_chars={} backlog_before={}",
+                "metric.translation_start seq={} source_chars={} context_segments={} backlog_before={}",
                 sequence_id,
                 source_text.chars().count(),
+                context_segments.len(),
                 backlog_before
             );
 
-            match translation::translate_ja_to_vi(&source_text) {
+            match translation::translate_ja_to_vi_with_context(&source_text, &context_segments) {
                 Ok(translated_text) => {
-                    let latency_ms = remove_translation_start(&mut translation_started_at, *sequence_id);
+                    let latency_ms =
+                        remove_translation_start(&mut translation_started_at, *sequence_id);
                     let backlog_after = transcription_rx.len();
                     log::info!(
                         "metric.translation_ready seq={} latency_ms={} translated_chars={} backlog_after={}",
@@ -381,13 +392,14 @@ fn spawn_translation_stage(
 
                     let _ = translation_frontend_tx.send(StreamingEvent::TranslationReady {
                         sequence_id: *sequence_id,
-                        source_text,
+                        source_text: source_text.clone(),
                         translated_text,
                         model: translation::model_name().to_string(),
                     });
                 }
                 Err(message) => {
-                    let latency_ms = remove_translation_start(&mut translation_started_at, *sequence_id);
+                    let latency_ms =
+                        remove_translation_start(&mut translation_started_at, *sequence_id);
                     let backlog_after = transcription_rx.len();
                     log::warn!(
                         "metric.translation_error seq={} latency_ms={} backlog_after={} message={}",
@@ -399,21 +411,47 @@ fn spawn_translation_stage(
 
                     let _ = translation_frontend_tx.send(StreamingEvent::TranslationError {
                         sequence_id: *sequence_id,
-                        source_text,
+                        source_text: source_text.clone(),
                         message,
                     });
                 }
             }
+
+            push_translation_context_segment(
+                &mut recent_source_history,
+                source_text,
+                TRANSLATION_CONTEXT_SEGMENTS,
+                TRANSLATION_CONTEXT_MAX_CHARS,
+            );
         }
 
         log::debug!("Translation stage exiting");
     });
 }
 
-fn remove_translation_start(
-    starts: &mut HashMap<u64, Instant>,
-    sequence_id: u64,
-) -> u128 {
+fn push_translation_context_segment(
+    history: &mut VecDeque<String>,
+    current_source: String,
+    max_segments: usize,
+    max_chars_per_segment: usize,
+) {
+    let normalized = current_source.trim();
+    if normalized.is_empty() {
+        return;
+    }
+
+    let bounded = normalized
+        .chars()
+        .take(max_chars_per_segment)
+        .collect::<String>();
+    history.push_back(bounded);
+
+    while history.len() > max_segments {
+        let _ = history.pop_front();
+    }
+}
+
+fn remove_translation_start(starts: &mut HashMap<u64, Instant>, sequence_id: u64) -> u128 {
     starts
         .remove(&sequence_id)
         .map(|started| started.elapsed().as_millis())

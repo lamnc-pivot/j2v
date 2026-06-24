@@ -26,6 +26,7 @@ struct TranslationWorkerHandle {
 
 struct TranslationTask {
     source_text: String,
+    context_segments: Vec<String>,
     response_tx: Sender<Result<String, String>>,
 }
 
@@ -133,6 +134,13 @@ struct OllamaGenerateResponse {
 }
 
 pub fn translate_ja_to_vi(source_text: &str) -> Result<String, String> {
+    translate_ja_to_vi_with_context(source_text, &[])
+}
+
+pub fn translate_ja_to_vi_with_context(
+    source_text: &str,
+    context_segments: &[String],
+) -> Result<String, String> {
     let trimmed = source_text.trim();
     if trimmed.is_empty() {
         return Err("Source text is empty".to_string());
@@ -145,6 +153,7 @@ pub fn translate_ja_to_vi(source_text: &str) -> Result<String, String> {
         .task_tx
         .send(TranslationTask {
             source_text: trimmed.to_string(),
+            context_segments: context_segments.to_vec(),
             response_tx,
         })
         .map_err(|_| "Translation worker is unavailable".to_string())?;
@@ -182,7 +191,7 @@ fn spawn_translation_worker() -> TranslationWorkerHandle {
             }
             breaker.close_if_elapsed(now);
 
-            match translate_with_retry(&client, &task.source_text) {
+            match translate_with_retry(&client, &task.source_text, &task.context_segments) {
                 Ok(translated) => {
                     breaker.on_success();
                     let _ = task.response_tx.send(Ok(translated));
@@ -199,10 +208,7 @@ fn spawn_translation_worker() -> TranslationWorkerHandle {
     TranslationWorkerHandle { task_tx }
 }
 
-fn drain_tasks_with_error(
-    task_rx: &crossbeam_channel::Receiver<TranslationTask>,
-    message: String,
-) {
+fn drain_tasks_with_error(task_rx: &crossbeam_channel::Receiver<TranslationTask>, message: String) {
     while let Ok(task) = task_rx.recv() {
         let _ = task.response_tx.send(Err(message.clone()));
     }
@@ -216,11 +222,15 @@ fn build_http_client() -> Result<Client, String> {
         .map_err(|e| format!("Failed to build HTTP client: {}", e))
 }
 
-fn translate_with_retry(client: &Client, source_text: &str) -> Result<String, String> {
+fn translate_with_retry(
+    client: &Client,
+    source_text: &str,
+    context_segments: &[String],
+) -> Result<String, String> {
     let mut last_error = "Unknown translation error".to_string();
 
     for attempt in 1..=MAX_TRANSLATION_ATTEMPTS {
-        match translate_with_ollama(client, source_text) {
+        match translate_with_ollama(client, source_text, context_segments) {
             Ok(translated) => {
                 if attempt > 1 {
                     log::info!(
@@ -254,10 +264,14 @@ fn translate_with_retry(client: &Client, source_text: &str) -> Result<String, St
     Err(last_error)
 }
 
-fn translate_with_ollama(client: &Client, source_text: &str) -> Result<String, TranslationFailure> {
+fn translate_with_ollama(
+    client: &Client,
+    source_text: &str,
+    context_segments: &[String],
+) -> Result<String, TranslationFailure> {
     let request = OllamaGenerateRequest {
         model: DEFAULT_QWEN_MODEL,
-        prompt: build_translation_prompt(source_text),
+        prompt: build_translation_prompt(source_text, context_segments),
         stream: false,
         keep_alive: "30m",
         options: OllamaGenerateOptions { temperature: 0.0 },
@@ -275,9 +289,9 @@ fn translate_with_ollama(client: &Client, source_text: &str) -> Result<String, T
         })?;
 
     let status = response.status();
-    let body = response
-        .text()
-        .map_err(|e| TranslationFailure::retryable(format!("Failed to read Ollama response: {}", e)))?;
+    let body = response.text().map_err(|e| {
+        TranslationFailure::retryable(format!("Failed to read Ollama response: {}", e))
+    })?;
 
     if !status.is_success() {
         let retryable_status = status.is_server_error() || status.as_u16() == 429;
@@ -301,8 +315,9 @@ fn translate_with_ollama(client: &Client, source_text: &str) -> Result<String, T
         });
     }
 
-    let parsed: OllamaGenerateResponse = serde_json::from_str(&body)
-        .map_err(|e| TranslationFailure::retryable(format!("Invalid Ollama JSON response: {}", e)))?;
+    let parsed: OllamaGenerateResponse = serde_json::from_str(&body).map_err(|e| {
+        TranslationFailure::retryable(format!("Invalid Ollama JSON response: {}", e))
+    })?;
 
     if let Some(error) = parsed.error {
         return Err(TranslationFailure::non_retryable(format!(
@@ -321,9 +336,22 @@ fn translate_with_ollama(client: &Client, source_text: &str) -> Result<String, T
     Ok(translated)
 }
 
-fn build_translation_prompt(source_text: &str) -> String {
-    format!(
-        "You are a professional Japanese to Vietnamese translator. Translate naturally and accurately into Vietnamese. Preserve meaning, names, and numbers. Output only Vietnamese text with no explanations.\n\nJapanese:\n{}\n\nVietnamese:",
-        source_text
-    )
+fn build_translation_prompt(source_text: &str, context_segments: &[String]) -> String {
+    let mut prompt = String::from(
+        "You are a professional Japanese to Vietnamese translator. Translate naturally and accurately into Vietnamese. Preserve meaning, names, and numbers. Use prior Japanese context to resolve pronouns and omitted subjects when helpful. Output only Vietnamese text with no explanations.\n\n",
+    );
+
+    if !context_segments.is_empty() {
+        prompt.push_str("Previous Japanese context (oldest to newest):\n");
+        for (index, segment) in context_segments.iter().enumerate() {
+            prompt.push_str(&format!("{}. {}\n", index + 1, segment));
+        }
+        prompt.push('\n');
+    }
+
+    prompt.push_str("Current Japanese:\n");
+    prompt.push_str(source_text);
+    prompt.push_str("\n\nVietnamese:");
+
+    prompt
 }
