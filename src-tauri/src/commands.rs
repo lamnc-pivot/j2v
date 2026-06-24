@@ -293,7 +293,12 @@ pub fn transcribe_audio_file(file_path: String) -> Result<String, String> {
     validate_whisper_model_dir(&model_dir)?;
 
     let result = transcription::transcribe_wav(&wav_path, &model_dir, &script_path)?;
-    log::info!("✅ Transcription done: {}", result.text);
+    log::info!(
+        "✅ Transcription done (lang={}, p={:.2}): {}",
+        result.language,
+        result.language_probability,
+        result.text
+    );
     Ok(result.text)
 }
 
